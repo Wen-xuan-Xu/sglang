@@ -16,7 +16,8 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional
+from collections import deque
+from typing import Dict, Iterable, List, Optional, Set
 
 import torch
 
@@ -26,7 +27,7 @@ from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
     LoRAType,
@@ -41,6 +42,75 @@ from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+
+class LoRAPrefetchPredictor:
+    """
+    LRU-based predictor for LoRA prefetching.
+    
+    Predicts which LoRA adapters are likely to be used in the next batch
+    based on recent access patterns.
+    """
+    
+    def __init__(self, history_size: int = 10):
+        """
+        Args:
+            history_size: Number of recent batches to track for prediction
+        """
+        self.history_size = history_size
+        self.recent_batches: deque = deque(maxlen=history_size)
+        self.lora_frequency: Dict[str, int] = {}
+    
+    def record_batch(self, lora_ids: Set[Optional[str]]):
+        """Record LoRA IDs used in current batch."""
+        # Filter out None (base model)
+        lora_ids_filtered = {uid for uid in lora_ids if uid is not None}
+        self.recent_batches.append(lora_ids_filtered)
+        
+        # Update frequency count
+        for uid in lora_ids_filtered:
+            self.lora_frequency[uid] = self.lora_frequency.get(uid, 0) + 1
+    
+    def predict_next_loras(
+        self, 
+        current_lora_ids: Set[Optional[str]],
+        max_predictions: int = 3
+    ) -> Set[str]:
+        """
+        Predict which LoRAs are likely to be used next.
+        
+        Strategy:
+        1. Continue using LoRAs from current batch (for decode phase)
+        2. Add most frequently used LoRAs from recent history
+        
+        Args:
+            current_lora_ids: LoRA IDs in current batch
+            max_predictions: Maximum number of additional LoRAs to predict
+            
+        Returns:
+            Set of predicted LoRA IDs
+        """
+        predictions = set()
+        
+        # 1. Current batch LoRAs (likely to continue in decode phase)
+        predictions.update({uid for uid in current_lora_ids if uid is not None})
+        
+        # 2. Most frequent LoRAs from recent history
+        if len(predictions) < max_predictions and self.lora_frequency:
+            # Sort by frequency
+            sorted_loras = sorted(
+                self.lora_frequency.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            for uid, _ in sorted_loras:
+                if uid not in predictions:
+                    predictions.add(uid)
+                    if len(predictions) >= max_predictions:
+                        break
+        
+        return predictions
 
 
 class LoRAManager:
@@ -86,6 +156,11 @@ class LoRAManager:
             target_modules=target_modules,
             lora_paths=lora_paths,
         )
+        
+        # Initialize prefetch predictor
+        self.prefetch_predictor = LoRAPrefetchPredictor(history_size=10)
+        self.enable_prefetch = getattr(server_args, 'enable_lora_prefetch', True)
+        logger.info(f"LoRA prefetch {'enabled' if self.enable_prefetch else 'disabled'}")
 
     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
@@ -263,6 +338,32 @@ class LoRAManager:
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
         )
+        
+        # Record current batch for prediction and prefetch next batch
+        if self.enable_prefetch:
+            self.prefetch_predictor.record_batch(cur_uids)
+            
+            # Predict and prefetch LoRAs for next batch
+            predicted_loras = self.prefetch_predictor.predict_next_loras(
+                current_lora_ids=cur_uids,
+                max_predictions=self.max_loras_per_batch
+            )
+            
+            # Prefetch predicted LoRAs that are not already loaded
+            for uid in predicted_loras:
+                if uid not in self.memory_pool.uid_to_buffer_id and uid in self.loras:
+                    # Find an available buffer slot for prefetch
+                    # We use a simple heuristic: prefetch to empty slots only
+                    for buffer_id in range(self.max_loras_per_batch):
+                        if self.memory_pool.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
+                            logger.debug(f"Prefetching LoRA {uid} to buffer {buffer_id}")
+                            self.memory_pool.async_prefetch_lora(
+                                uid=uid,
+                                buffer_id=buffer_id,
+                                lora_adapter=self.loras[uid],
+                                lora_modules=self.lora_modules,
+                            )
+                            break
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -464,3 +565,8 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
+    
+    def log_prefetch_metrics(self):
+        """Log prefetch performance metrics."""
+        if self.enable_prefetch:
+            self.memory_pool.log_prefetch_metrics()

@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -88,6 +89,18 @@ class LoRAMemoryPool:
         ] * self.max_loras_per_batch
 
         self.init_buffers(base_model)
+        
+        # Initialize async prefetch support
+        self.prefetch_stream = torch.cuda.Stream()
+        self.prefetch_events: Dict[str, torch.cuda.Event] = {}
+        self.prefetching_uids: Set[str] = set()
+        
+        # Prefetch metrics
+        self.total_prefetch_attempts = 0
+        self.prefetch_hits = 0
+        self.prefetch_misses = 0
+        self.total_transfer_time_ms = 0.0
+        self.total_wait_time_ms = 0.0
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
         """
@@ -243,9 +256,23 @@ class LoRAMemoryPool:
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
-                self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapter, lora_modules
-                )
+                
+                # Check if this LoRA was prefetched
+                if uid in self.prefetch_events:
+                    # Prefetch hit! Just wait for completion
+                    wait_time = self.wait_for_prefetch(uid)
+                    self.prefetch_hits += 1
+                    logger.debug(
+                        f"LoRA {uid} prefetch HIT, waited {wait_time:.2f}ms"
+                    )
+                else:
+                    # Prefetch miss, load synchronously
+                    self.prefetch_misses += 1
+                    self.load_lora_weight_to_buffer(
+                        uid, buffer_id, lora_adapter, lora_modules
+                    )
+                    logger.debug(f"LoRA {uid} prefetch MISS, loaded synchronously")
+                
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
@@ -331,3 +358,148 @@ class LoRAMemoryPool:
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]
+    
+    def async_prefetch_lora(
+        self,
+        uid: str,
+        buffer_id: int,
+        lora_adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+    ):
+        """
+        Asynchronously prefetch LoRA weights to GPU buffer using dedicated CUDA stream.
+        
+        Args:
+            uid: LoRA adapter unique ID
+            buffer_id: Target buffer slot ID
+            lora_adapter: LoRA adapter containing weights
+            lora_modules: LoRA modules for tensor parallel slicing
+        """
+        if uid in self.prefetching_uids or uid in self.uid_to_buffer_id:
+            # Already prefetching or already loaded
+            return
+        
+        self.prefetching_uids.add(uid)
+        start_time = time.perf_counter()
+        
+        def async_load_lora_weight_tensor(
+            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
+        ):
+            if weight is None:
+                buffer_view.zero_()
+            else:
+                assert (
+                    buffer_view.shape == weight.shape
+                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                # Key change: non_blocking=True for async transfer
+                buffer_view.copy_(weight, non_blocking=True)
+        
+        with torch.cuda.stream(self.prefetch_stream):
+            if uid is None:
+                for i in range(self.num_layer):
+                    for k in self.A_buffer.keys():
+                        self.A_buffer[k][i][buffer_id] = 0
+            else:
+                assert lora_adapter is not None
+                lora_rank = lora_adapter.config.r
+                for layer_id in range(self.num_layer):
+                    layer_weights = lora_adapter.layers[layer_id].weights
+                    temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
+                        target_module: None for target_module in self.A_buffer
+                    }
+                    temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
+                        target_module: None for target_module in self.B_buffer
+                    }
+                    for name, weights in layer_weights.items():
+                        target_module = get_target_module_name(name, self.target_modules)
+                        if "lora_A" in name:
+                            temp_A_buffer[target_module] = weights
+                        else:
+                            temp_B_buffer[target_module] = weights
+
+                    if self.tp_size > 1:
+                        cur_layer_modules = lora_modules[layer_id]
+                        for module_name, module in cur_layer_modules.items():
+                            target_module = get_target_module_name(
+                                module_name, self.target_modules
+                            )
+
+                            if temp_A_buffer[target_module] is None:
+                                continue
+
+                            temp_A_buffer[target_module] = module.slice_lora_a_weights(
+                                temp_A_buffer[target_module], self.tp_rank
+                            )
+                            temp_B_buffer[target_module] = module.slice_lora_b_weights(
+                                temp_B_buffer[target_module], self.tp_rank
+                            )
+
+                    for name, weights in temp_A_buffer.items():
+                        c = get_stacked_multiply(name)
+                        target_buffer = self.A_buffer[name][layer_id]
+                        buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
+                        async_load_lora_weight_tensor(buffer_view, weights)
+
+                    for name, weights in temp_B_buffer.items():
+                        target_buffer = self.B_buffer[name][layer_id]
+                        buffer_view = target_buffer[buffer_id, :, :lora_rank]
+                        async_load_lora_weight_tensor(buffer_view, weights)
+            
+            # Record event to track completion
+            event = torch.cuda.Event()
+            event.record(self.prefetch_stream)
+            self.prefetch_events[uid] = event
+        
+        transfer_time = (time.perf_counter() - start_time) * 1000
+        self.total_transfer_time_ms += transfer_time
+        self.total_prefetch_attempts += 1
+        
+        logger.debug(
+            f"Async prefetch initiated for LoRA {uid} to buffer {buffer_id}, "
+            f"transfer_time={transfer_time:.2f}ms"
+        )
+    
+    def wait_for_prefetch(self, uid: str) -> float:
+        """
+        Wait for async prefetch to complete for given LoRA.
+        
+        Args:
+            uid: LoRA adapter unique ID
+            
+        Returns:
+            Wait time in milliseconds
+        """
+        if uid not in self.prefetch_events:
+            return 0.0
+        
+        start_time = time.perf_counter()
+        event = self.prefetch_events[uid]
+        event.wait()
+        wait_time = (time.perf_counter() - start_time) * 1000
+        
+        # Clean up
+        del self.prefetch_events[uid]
+        self.prefetching_uids.discard(uid)
+        
+        self.total_wait_time_ms += wait_time
+        
+        if wait_time > 1.0:  # Only log if significant wait time
+            logger.debug(f"Waited {wait_time:.2f}ms for LoRA {uid} prefetch to complete")
+        
+        return wait_time
+    
+    def log_prefetch_metrics(self):
+        """Log prefetch performance metrics."""
+        if self.total_prefetch_attempts == 0:
+            return
+        
+        hit_rate = self.prefetch_hits / self.total_prefetch_attempts
+        avg_transfer_time = self.total_transfer_time_ms / self.total_prefetch_attempts
+        avg_wait_time = self.total_wait_time_ms / self.total_prefetch_attempts if self.prefetch_hits > 0 else 0
+        
+        logger.info(
+            f"LoRA Prefetch Metrics: "
+            f"Hit Rate={hit_rate:.2%} ({self.prefetch_hits}/{self.total_prefetch_attempts}), "
+            f"Avg Transfer Time={avg_transfer_time:.2f}ms, "
+            f"Avg Wait Time={avg_wait_time:.2f}ms"
+        )
