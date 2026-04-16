@@ -462,6 +462,28 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def maybe_strip_thinking_tokens(
+    req: Req, token_ids_len: int | None = None
+) -> int | None:
+    """Return the cacheable prefix length for separated-thinking requests.
+
+    When a parser exposes reasoning as hidden content, future turns only carry
+    the visible assistant text. Any output KV generated after the original
+    prompt becomes unsafe to reuse, so only the original input prefix remains
+    cacheable.
+    """
+
+    if getattr(req, "reasoning_tokens", 0) <= 0:
+        return None
+    if not getattr(req, "strip_thinking_from_cache", True):
+        return None
+
+    prefix_len = len(getattr(req, "origin_input_ids", []))
+    if token_ids_len is not None:
+        prefix_len = min(prefix_len, token_ids_len)
+    return prefix_len
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:

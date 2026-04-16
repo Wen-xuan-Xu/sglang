@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import maybe_strip_thinking_tokens
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
@@ -478,6 +479,9 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        cacheable_len = maybe_strip_thinking_tokens(req, len(token_ids))
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -516,6 +520,9 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        cacheable_len = maybe_strip_thinking_tokens(req, len(token_ids))
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids

@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import maybe_strip_thinking_tokens
 from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     IOHandle,
     RadixTreeCpp,
@@ -176,23 +177,28 @@ class RadixCacheCpp(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ].to(dtype=torch.int64, copy=True)
+        cacheable_len = maybe_strip_thinking_tokens(req, len(token_ids))
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
+        cache_kv_indices = kv_indices[: len(token_ids)]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
+        old_prefix_len = req.cache_protected_len // self.page_size * self.page_size
+        page_aligned_overall_len = len(token_ids) // self.page_size * self.page_size
 
         if is_insert:
-            new_prefix_len = self._insert(
-                RadixKey(token_ids, req.extra_key), kv_indices
-            )
-            # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
-            assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
-            # Free duplicates that were already in the pool
-            if old_prefix_len < new_prefix_len:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[old_prefix_len:new_prefix_len]
+            if page_aligned_overall_len > 0:
+                new_prefix_len = self._insert(
+                    RadixKey(token_ids, req.extra_key), cache_kv_indices
                 )
+                # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
+                assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
+                # Free duplicates that were already in the pool
+                if old_prefix_len < new_prefix_len:
+                    self.token_to_kv_pool_allocator.free(
+                        kv_indices[old_prefix_len:new_prefix_len]
+                    )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_overall_len]
@@ -214,11 +220,17 @@ class RadixCacheCpp(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
+        cacheable_len = maybe_strip_thinking_tokens(req, prefill_len)
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
+        cache_kv_indices = kv_indices[: len(token_ids)]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
+        old_prefix_len = req.cache_protected_len // self.page_size * self.page_size
+        new_prefix_len = self._insert(
+            RadixKey(token_ids, req.extra_key), cache_kv_indices
+        )
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -248,12 +260,13 @@ class RadixCacheCpp(BasePrefixCache):
 
         # NOTE: there might be unaligned tail, so we may need to append it
         assert len(new_indices) <= prefill_len < len(new_indices) + self.page_size
-        if self.page_size != 1 and len(new_indices) < prefill_len:
+        if len(new_indices) < prefill_len:
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
         else:
             req.prefix_indices = new_indices
+        req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
 
     def pretty_print(self):

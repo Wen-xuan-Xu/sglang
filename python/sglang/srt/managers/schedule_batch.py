@@ -644,6 +644,7 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        self.strip_thinking_from_cache = True
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):

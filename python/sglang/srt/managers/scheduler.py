@@ -592,6 +592,9 @@ class Scheduler(
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            self.model_config.strip_thinking_from_cache = (
+                reasoning_parser.detector.strip_thinking_from_cache
+            )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
@@ -2054,6 +2057,7 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        req.strip_thinking_from_cache = self.model_config.strip_thinking_from_cache
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return

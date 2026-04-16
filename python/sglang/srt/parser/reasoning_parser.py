@@ -19,6 +19,10 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
+    # Most reasoning parsers separate hidden thinking from visible assistant
+    # content, so those tokens should not be cached across turns.
+    strip_thinking_from_cache: bool = True
+
     def __init__(
         self,
         think_start_token: str,
@@ -394,6 +398,10 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
     Append `<think>` token to the beginning of the text.
     """
+
+    # MiniMax appends thinking into visible assistant content, so future turns
+    # may include it verbatim and the full output should stay cacheable.
+    strip_thinking_from_cache: bool = False
 
     def __init__(
         self,

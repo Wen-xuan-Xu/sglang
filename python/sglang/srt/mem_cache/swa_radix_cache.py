@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import maybe_strip_thinking_tokens
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -455,6 +456,9 @@ class SWARadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        cacheable_len = maybe_strip_thinking_tokens(req, len(token_ids))
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
 
         # Maybe convert to bigram keys for EAGLE
         keys = self.key_convert_fn(token_ids)
@@ -507,6 +511,9 @@ class SWARadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        cacheable_len = maybe_strip_thinking_tokens(req, len(token_ids))
+        if cacheable_len is not None:
+            token_ids = token_ids[:cacheable_len]
 
         keys = self.key_convert_fn(token_ids)
         keys = page_align_keys(keys, self.page_size)
